@@ -9,8 +9,10 @@
 #include <condition_variable>
 #include <algorithm>
 #include <string>
+#include <time.h>
 
-void log(const std::string && str)
+// Thread-safe std::cout
+void log(const std::string &&str)
 {
     static std::mutex _m;
     std::lock_guard<std::mutex> lock(_m);
@@ -22,7 +24,7 @@ struct Message
     const std::string phone_number;
     const std::string login;
 
-    Message(const std::string && _phone_number, const std::string && _login): phone_number(_phone_number), login(_login) {};
+    Message(const std::string &&_phone_number, const std::string &&_login) : phone_number(_phone_number), login(_login){};
 
     bool IsValid()
     {
@@ -30,70 +32,76 @@ struct Message
     }
 };
 
-template<class MessageType>
+/**
+ * @brief Thread-safe shared container, implemented as queue  
+ * 
+ * @tparam MessageType 
+ */
+template <class MessageType>
 class Container
 {
 private:
     std::queue<MessageType> _container;
     std::mutex _mutex;
     std::condition_variable _cv;
+
 public:
-    void push(MessageType && message)
+    void push(MessageType &&message)
     {
         std::lock_guard<std::mutex> lock(_mutex);
         _container.push(message);
         _cv.notify_one();
     }
 
-    // Non-blocking call
-    std::optional<MessageType> try_pop()
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-        if (_container.empty())
-            return {};
-        MessageType result = _container.front();
-        _container.pop();
-        return result;
-    }
-
-    // Blocking call - blocks the thread, until receiving an element from container
+    /**
+     * @brief Blocks the thread until element is received from the container
+     * 
+     * @return MessageType
+     */
     MessageType pop()
     {
         std::unique_lock<std::mutex> lock(_mutex);
-        _cv.wait(lock, [this](){return !_container.empty();});
-        MessageType result = _container.front();
+        _cv.wait(lock, [this]()
+                 { return !_container.empty(); });
+        MessageType result = std::move(_container.front());
         _container.pop();
         lock.unlock();
-        return result;
+        return std::move(result);
     }
 
     bool empty()
     {
-        return  _container.empty();
+        return _container.empty();
     }
 };
 
 class Generator
 {
-    Container<Message> & _container;
+    Container<Message> &_container;
     std::thread _thread;
-    bool _terminate_flag = false;
-    
+    std::atomic<bool> _terminate_flag;
+
 public:
-    Generator(Container<Message> & container): _container(container)
+    Generator(Container<Message> &container) : _container(container)
     {
-        _thread = std::thread([](Container<Message> & container, bool & terminate){
-            int i = 0;
-            while (!terminate)
+        _terminate_flag = false;
+        _thread = std::thread([](Container<Message> &container, std::atomic<bool> &terminate)
             {
-                std::string login = "Mobiou";
-                login += (i%3 == 0 ? "s" : "");
-                Message msg("+7-915-" + std::to_string(++i), std::move(login));
-                log("[Generator]: Adding (" + msg.phone_number + ", " + msg.login + ")");
-                container.push(std::move(msg));
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-            } 
-        }, std::ref(_container), std::ref(_terminate_flag));
+                srand(time(0));
+                std::string number, login;
+                while (!terminate)
+                {
+                    static int i = 0;
+                    number = "+7-915-XXX-XX-0" + std::to_string(i % 7);
+                    login = std::string("login_") + char(97 + (rand() % 10));
+                    ++i;
+                    Message msg(std::move(number), std::move(login));
+                    log("[Debug] [Generator]: Adding (" + msg.phone_number + ", " + msg.login + ")");
+                    container.push(std::move(msg));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                }
+            },
+            std::ref(_container), std::ref(_terminate_flag));
     };
 
     ~Generator()
@@ -105,67 +113,97 @@ public:
 
 class Searcher
 {
-    Container<Message> & _container;
+    Container<Message> &_container;
     std::thread _thread;
-    bool _terminate_flag = false;
+    std::atomic<bool> _terminate_flag;
 
     using timestamp = std::chrono::steady_clock::time_point;
-    std::list<std::pair<timestamp, Message>> _buffer; //std::pair<Message, timestamp>> _buffer;
+    std::list<std::pair<timestamp, Message>> _buffer; // buffer queue
     const unsigned int _delay = 5;
 
-public:
-    Searcher(Container<Message> & container): _container(container)
+    void remove_expired()
     {
-        _thread = std::thread([this](){
-            while (!_terminate_flag)
+        auto time = std::chrono::steady_clock::now();
+        auto first_expired = std::find_if(_buffer.begin(), _buffer.end(),
+            [this, &time](const std::pair<Searcher::timestamp, Message> &elem)
             {
-                if (!_container.empty())
+                auto diff = std::chrono::duration_cast<std::chrono::seconds>(time - elem.first);
+                return diff.count() >= _delay;
+            });
+        // All elements after first_expired are expired too
+        if (first_expired != _buffer.end())
+        {
+            // Debug log
+            std::string expired_elements;
+            for (auto it = first_expired; it != _buffer.end(); ++it)
+            {
+                expired_elements += "\n\t(" + it->second.phone_number + ", " + it->second.login + ")";
+            }
+            log("[Debug] [Searcher]: Expired elements with delay " + std::to_string(_delay) + "s:" + expired_elements);
+            // \Debug log
+
+            _buffer.erase(first_expired, _buffer.end());
+        }
+    }
+
+    std::list<std::pair<Searcher::timestamp, Message>>::iterator search(const Message &msg)
+    {
+        // Validate container
+        remove_expired();
+
+        // Find candidate
+        auto best_candidate = _buffer.end();
+        unsigned int max_score = 0;
+        for (auto it = _buffer.rbegin(); it != _buffer.rend(); ++it)
+        {
+            unsigned int score = (msg.login == it->second.login) + (msg.phone_number == it->second.phone_number);
+            if (score > max_score)
+            {
+                max_score = true;
+                best_candidate = --it.base(); // reverse_iterator to iterator
+            }
+        }
+        return best_candidate;
+    }
+
+public:
+    Searcher(Container<Message> &container) : _container(container)
+    {
+        _terminate_flag = false;
+        _thread = std::thread([this]()
+            {
+                while (!_terminate_flag)
                 {
-                    auto msg = _container.pop(); // blocks thread until message receiving
-                    auto time = std::chrono::steady_clock::now();
-                    // Delete expired messages
-                    auto first_expired = std::find_if(_buffer.begin(), _buffer.end(), 
-                        [this, &time](const std::pair<Searcher::timestamp, Message> & elem){
-                            auto diff = std::chrono::duration_cast<std::chrono::seconds>(time - elem.first);
-                            return diff.count() >= _delay;
-                        });
-                    // If found expired element -> all elements after are expired too
-                    if (first_expired != _buffer.end())
+                    if (!_container.empty())
                     {
-                        std::string expired_elements;
-                        for (auto it = first_expired; it != _buffer.end(); ++it)
+                        auto msg = _container.pop(); // blocks thread until message receiving
+                        auto time = std::chrono::steady_clock::now();
+                        auto found_it = search(msg);
+                        if (found_it != _buffer.end())
                         {
-                            expired_elements += "\n(" + it->second.phone_number + ", " + it->second.login + ")";
+                            // Debug log
+                            std::string elements;
+                            for (auto it = _buffer.begin(); it != _buffer.end(); ++it)
+                            {
+                                elements += "\n\t(" + it->second.phone_number + ", " + it->second.login + ")";
+                            }
+                            if (!elements.empty())
+                                log("[Debug] [Searcher]: Internal storage:" + elements);
+                            // \Debug log
+
+                            unsigned int score = (msg.login == found_it->second.login) + (msg.phone_number == found_it->second.phone_number);
+                            log("[Searcher]: Found (with score: " + std::to_string(score) + ")\n" +
+                                "\tFrom shared storage: (" + msg.phone_number + ", " + msg.login + ")\n" +
+                                "\tFrom internal storage: (" + found_it->second.phone_number + ", " + found_it->second.login + ")\n");
+                            _buffer.erase(found_it);
                         }
-                        log("[Searcher]: Expired elements:" + expired_elements);
-                        _buffer.erase(first_expired, _buffer.end());                       
-                    }
-
-                    auto best_candidate = _buffer.end();
-                    unsigned int max_score = 0;
-                    for (auto it = _buffer.begin(); it != _buffer.end(); ++it)
-                    {
-                        unsigned int score = (msg.login == it->second.login) + (msg.phone_number == it->second.phone_number);
-                        if (score > max_score)
+                        else
                         {
-                            max_score = true;
-                            best_candidate = it;
-                        }   
-                    }
-
-                    if (best_candidate != _buffer.end())
-                    {
-                        log("[Searcher]: Found (" + best_candidate->second.phone_number + ", " + best_candidate->second.login + ")");
-                        _buffer.erase(best_candidate);
-                    }
-                    else
-                    {
-                        //log("[Searcher]: Not found (" + msg.phone_number + ", " + msg.login + ")");
-                        _buffer.emplace_front(time, msg); // newer items infront
+                            _buffer.emplace_front(time, msg); // newer items infront
+                        }
                     }
                 }
-            } 
-        });
+            });
     };
 
     ~Searcher()
@@ -182,7 +220,7 @@ int main()
     Generator generator_thread(shared_container);
     Searcher searcher_thread(shared_container);
 
-    std::this_thread::sleep_for(std::chrono::seconds(10));
+    std::this_thread::sleep_for(std::chrono::seconds(50));
 
     return 0;
 }
